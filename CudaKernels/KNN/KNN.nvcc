@@ -1,0 +1,123 @@
+/* K nearest Neighbours Kernel for large datasets ( backported from the improved version at http://github.com/TrentHouliston/Isomaped )
+####################################################################################################################################################
+#Copyright (c) 2013, Josiah Walker and Trent Houliston
+#All rights reserved.
+#
+#Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+#
+#    Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+#    Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or #other materials provided with the distribution.
+#
+#THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED #WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY #DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS #OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING #NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+####################################################################################################################################################
+*/
+
+/**
+* This kernel calculates the K nearest neighbours for the input matrix by chunking it into individual sections.
+* This allows the GPU to do a KNN on datasets that are larger then the amount of memory on the device. It is to
+* be called by splitting the input data into "Chunks" that fit on the gpu memory, and alternate them until every
+* chunk has been loaded as both source and dest. This results in a complete KNN map for all of the data.
+*
+*
+*
+* @param source Our "Source" chunk of data to do KNN on
+* @param target Our "Target" chunk, the chunk we are comparing distances to
+* @param dimensions The dimensionality of the source/target data
+* @param indices The indexes to the nearest k neighbours (matches with distances)
+* @param distances The distances to our nearest k neighbours (matches with indices)
+* @param kMax The number of nodes to include in our K nearest
+* @param epsilon Our epsilon to limit the distance of KMeans by
+* @param dataSize The total number of data elements we are processing (for bounds checking)
+* @param chunkSize The size of our chunks (for bounds checking)
+* @param sourceOffset The offset from 0 that the real (non chunked) index of our source chunk is
+* @param targetOffset The offset from 0 that the real (non chunked) index of our target chunk is
+* @param maxThreads The number of threads the host CUDA version supports
+*
+* @author Josiah Walker
+* @author Trent Houliston
+*/
+#define MAXBLOCKS 65536 //this will probably never get used, but in the event that we are over 10 million objects it helps.
+
+
+__device__ unsigned int heapInsertFloat (unsigned int* heapDataI, float* heapDataF, const unsigned int heapInsertI, const float heapInsertF) {
+    unsigned int index = (heapInsertF < heapDataF[0]); //if d < root, move to the next node to check
+    
+    const bool inserted = index != 0; //check if we insert at all
+    
+    while (index < MAXKMAX and (heapDataF[index] > heapInsertF or heapDataF[index+1] > heapInsertF)) { //walk the bheap
+        
+        //get the index of the new largest leaf
+        const unsigned int newIndex = index+(heapDataF[index]<heapDataF[index+1]);
+        
+        //shift the leaf up
+        heapDataF[index/2] = heapDataF[newIndex];
+        heapDataI[index/2] = heapDataI[newIndex];
+        
+        //increment the target index
+        index = 2*newIndex+1;
+    }
+    if (inserted) { //copy in the final values
+        heapDataF[index/2] = heapInsertF;
+        heapDataI[index/2] = heapInsertI;
+    }
+    return index; //return 2*index+1 we inserted at; 0 = not inserted
+}
+
+
+__global__ void KNN(const float* source,
+                    const float* target,
+                    unsigned int* indices,
+                    float* knn,
+                    const long dimensions,
+                    const long kMax,
+                    const long epsilon,
+                    const long dataSize, //use longs instead of uints because numpy doesn't support single value uint32
+                    const long chunkSize,
+                    const long sourceOffset,
+                    const long targetOffset) {
+    
+    const unsigned int elementIndex = (threadIdx.x+blockIdx.x*1024+blockIdx.y*1024*MAXBLOCKS);
+    const unsigned int sourceLimit = min((unsigned int)(chunkSize+sourceOffset),(unsigned int)dataSize)-sourceOffset;
+    const unsigned int targetLimit = min((unsigned int)(chunkSize+targetOffset),(unsigned int)dataSize)-targetOffset;
+    const unsigned int offset = elementIndex*kMax;
+    
+    //make local memory arrays
+    float distances[CHUNKSIZE];
+    float knnD[MAXKMAX+1];
+    unsigned int knnI[MAXKMAX+1];
+    
+    if (elementIndex < sourceLimit) {
+        
+        for (unsigned int i = 0; i < kMax; ++i) { //Prefill the KNN heap from main memory
+            knnD[i] = knn[offset + i];
+            knnI[i] = indices[offset + i];
+        }
+        
+        const float s0 = source[elementIndex];
+        for (unsigned int i = 0; i < targetLimit; ++i) { //clear the local memory, replacing with our first values so we don't waste ops
+            const float value = target[i] - s0;
+            distances[i] = value*value;
+        }
+        
+        for (unsigned int j = 1; j < dimensions; ++j) { //add up all the dot products column by column
+            const float s = source[elementIndex + j*sourceLimit];
+            for (unsigned int i = 0; i < targetLimit; i++) {
+                const float value = target[i  + j*targetLimit] - s;
+                distances[i] += value * value;
+            }
+        }
+        
+        //use a binary maxheap to insert new neighbours
+        for (unsigned int i = 0; i < targetLimit; ++i) {
+            //get the next distance
+            const float d = sqrt(distances[i]);
+            heapInsertFloat(knnI,knnD,i+targetOffset,d);
+        }
+        
+        //copy the remainder to main memory
+        for (unsigned int i = 0; i < kMax; ++i) {
+            knn[offset + i] = knnD[i];
+            indices[offset + i] = knnI[i];
+        }
+    }
+}
